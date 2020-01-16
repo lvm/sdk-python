@@ -6,12 +6,14 @@ Access MercadoPago for payments integration
 """
 
 from json.encoder import JSONEncoder
-import requests
-
+import requests , json
+import platform
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.poolmanager import PoolManager
 import ssl
-
+import threading
+from datetime import datetime
+from datetime import timedelta
 
 class MPSSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
@@ -28,7 +30,12 @@ class MPException(Exception):
 
 class MPInvalidCredentials(MPException):
     pass
-
+class MPTrafficLight:
+  def __init__(self, send_data, ttl,endpoint_whitelist,base64_encode):
+    self.send_data = send_data
+    self.ttl = ttl
+    self.endpoint_whitelist = endpoint_whitelist
+    self.base64_encode = base64_encode
 
 class MP(object):
     version = "0.3.4"
@@ -313,12 +320,17 @@ class MP(object):
     ##################################################################################
     class __RestClient(object):
         __API_BASE_URL = "https://api.mercadopago.com"
+        __METRICS_URL = "https://events.mercadopago.com/v2/metric"
+        __TRAFFIC_LIGHT_URL = "https://events.mercadopago.com/v2/traffic-light"
         MIME_JSON = "application/json"
         MIME_FORM = "application/x-www-form-urlencoded"
+        CLIENT_NAME =  "MercadoPago Python SDK"
 
         def __init__(self, outer):
             self.__outer = outer
-            self.USER_AGENT = "MercadoPago Python SDK v"+self.__outer.version
+            self.USER_AGENT = self.CLIENT_NAME + " v " + self.__outer.version
+            self.APP_VERSION = self.__outer.version
+            self.trafic_light = None
 
         def get_mercadopago_transport_adapter(self):
             """Creates and returns the transport adaptor for MP"""
@@ -332,7 +344,7 @@ class MP(object):
             session.mount(self.__API_BASE_URL,
                           self.get_mercadopago_transport_adapter())
             return session
-
+    
         def get(self, uri, params=None):
             s = self.get_session()
             api_result = s.get(self.__API_BASE_URL+uri, params=params, headers={'User-Agent':self.USER_AGENT, 'Accept':self.MIME_JSON})
@@ -343,19 +355,30 @@ class MP(object):
             }
 
             return response
-
+  
         def post(self, uri, data=None, params=None, content_type=MIME_JSON):
             if data is not None and content_type == self.MIME_JSON:
                 data = JSONEncoder().encode(data)
 
             s = self.get_session()
+
             api_result = s.post(self.__API_BASE_URL+uri, params=params, data=data, headers={'User-Agent':self.USER_AGENT, 'Content-type':content_type, 'Accept':self.MIME_JSON})
+            
+            r = None
+            try:
+                r = self.__get_traffic_light()
+                
+            except:
+                print("Error call traffic light service")
+
+            if not r is None and r.send_data and self.__Is_UrlWhitelist(self.__API_BASE_URL+uri , r.endpoint_whitelist):
+                threading.Thread(target=self.__send_insights, args=(api_result,), daemon=True).start()
+            
 
             response = {
                 "status": api_result.status_code,
                 "response": api_result.json()
             }
-
             return response
 
         def put(self, uri, data=None, params=None, content_type=MIME_JSON):
@@ -364,6 +387,7 @@ class MP(object):
 
             s = self.get_session()
             api_result = s.put(self.__API_BASE_URL+uri, params=params, data=data, headers={'User-Agent':self.USER_AGENT, 'Content-type':content_type, 'Accept':self.MIME_JSON})
+            s.send
 
             response = {
                 "status": api_result.status_code,
@@ -383,3 +407,71 @@ class MP(object):
 
             return response
 
+        def __get_traffic_light(self):
+            if not self.trafic_light is None and self.trafic_light.ttl > datetime.now():
+                return self.trafic_light
+
+            s = self.get_session()
+            headers = {'User-Agent':self.USER_AGENT, 'Content-type':self.MIME_JSON, 'Accept':self.MIME_JSON, 'X-Insights-Metric-Lab-Scope':'test'}
+
+            request = {
+                "client-info":{
+                    "name": self.CLIENT_NAME,
+                    "version": self.APP_VERSION
+                }
+            }
+
+            rh = json.dumps(request)
+
+            api_result = s.post(self.__TRAFFIC_LIGHT_URL, data=rh , headers=headers )
+            result = api_result.json()
+            ttl = (datetime.now() + timedelta(seconds=result.get("ttl")))
+            self.trafic_light =  MPTrafficLight(result.get("send-data") , ttl  , result.get("endpoint-whitelist") , result.get("base64-encode-data"))
+            return self.trafic_light
+
+        def __send_insights(self, resp, *args, **kwargs):
+            s = self.get_session()
+            
+            headers = {'User-Agent':self.USER_AGENT, 'Content-type':self.MIME_JSON, 'Accept':self.MIME_JSON, 'X-Insights-Metric-Lab-Scope':'test'}
+            insight = {
+                    "client-info":{
+                            "name":"MercadoPago-SDK-Python",
+                            "version": self.APP_VERSION
+                    },
+                     "protocol-info": {
+                            "name": "http",
+                            "protocol-http": {
+                                "request-method": resp.request.method,
+                                "request-url": resp.request.url,
+                                "request-headers": {
+                                    "X-Request-Id": resp.headers.get("x-request-id"),
+                                    "Content-Type": resp.request.headers.get("content-type"),
+                                    "Content-Length": len(resp.content)
+                                },
+                                "response-status-code": resp.status_code,
+                                "response-headers": {
+                                    "Content-Type": resp.headers.get("content-type"),
+                                    "Content-Length": resp.headers.get("content-length")
+                                }
+                            }
+                            
+                        }
+                }
+            rh = json.dumps(insight)
+            result = s.post(self.__METRICS_URL, data=rh, headers=headers)
+            print(result.status_code)    
+
+        def __Is_UrlWhitelist(self , requestUrl  , urlsWhiteList):
+            
+            for url in urlsWhiteList:
+                if url == "*":
+                    return True
+                matched = True   
+                patterns = url.split("*")
+                for pattern in patterns:
+                    if len(pattern) == 0:
+                        continue
+                    matched = matched and requestUrl.lower().find(pattern.lower()) != -1
+                if matched:
+                    return True       
+            return False        
